@@ -10,29 +10,122 @@ use Try::Tiny;
 
 =head1 NAME
 
-DateTimeX::Period - simple subclass of DateTime, which provides simple methods
-to work in period context such as a day.
+DateTimeX::Period - Provides safe methods to get start and end of period
+in all timezones.
 
 =head1 VERSION
 
-Version 0.01
+This document describes DateTimeX::Period version 0.02
 
 =cut
 
-our $VERSION = '0.01';
-
+our $VERSION = '0.02';
 
 =head1 SYNOPSIS
 
+	# Optionally get local timezone
 	use DateTime::TimeZone qw();
+	my $timezone = DateTime::TimeZone->new( name => 'local' )->name();
+
 	use DateTimeX::Period qw();
 
-	my $dt = DateTimeX::Period->from_epoch(
-		epoch => time(),
-		time_zone => DateTime::TimeZone->new( name => 'local' )->name()
+	my $dt = DateTimeX::Period->now(
+		time_zone => $timezone,
 	);
 	my $interval_start = $dt->get_start('month');
 	my $interval_end   = $dt->get_end('month');
+
+=head1 DESCRIPTION
+
+DateTimeX::Period is a subclass of DateTime & provides easy yet safe methods
+to work in period context such as a day for all timezones.
+
+It is recommended practise to work in UTC and switch to specific timezones only
+when needed. IF YOU CAN DO SO, THEN THIS MODULE IS NOT FOR YOU!!!
+
+Yet sometimes this is not possible and this module can help you. It works
+around such problems like:
+
+1. Assume you want to get start of the month, it's convenient to use
+truncate() available in DateTime, however this would throw an error:
+
+ use DateTime;
+ my $dt = DateTime->new(
+ 	year      => 2011,
+ 	month     => 4,
+ 	day       => 2,
+ 	time_zone => 'Asia/Amman'
+ );
+ $dt->truncate(to => 'month'); # Runtime error
+
+Q: You might have guessed, what did I do wrong?
+ A: Well time between 00:00 - 00:59 01/04/2011 in 'Asia/Amman' did not exist.
+ There are cases when you can't truncate to weeks, days or even hours!
+ ( see unit tests ).
+
+2. Assume your client that lives in 'America/Goose_Bay' is running your app and
+today is 13/03/2010 00:05, and your app for whatever reason adds a day:
+
+ use DateTime;
+ my $dt = DateTime->new(
+ 	year      =>2010,
+ 	month     => 3,
+ 	day       => 13,
+ 	minute    => 5,
+ 	time_zone => 'America/Goose_Bay',
+ );
+ $dt->add(days => 1); # Runtime error!
+
+Q: What's wrong now?
+ A: 14/03/2010 00:05 in 'America/Goose_Bay' did not exist!
+
+3. Assume you are running critical application that needs to get epoch!
+Conveniently DateTime has epoch() and for whatever reasons you need to perform
+some operations, such as these:
+ use DateTime;
+ my $dt = DateTime->new(
+ 	year=> 2013,
+ 	month => 10,
+ 	day => 26,
+ 	hour => 23,
+ 	minute => 59,
+	second => 59,
+ 	time_zone => 'Atlantic/Azores',
+ );
+ $dt->add( seconds => 1 );    # 2013-10-27T00:00:00  same
+ print $dt->epoch();          # 1382832000           diff!!!
+ $dt->truncate(to => 'hour'); # 2013-10-27T00:00:00  same
+ print $dt->epoch();          # 1382835600           diff!!!
+
+Q: Why epoch() returns different epoch time when local time doesn't change?
+ A: It so happens that 00:00 occurred twice! DateTime documentation classify this
+ as ambiguous and always returns later date! Whereas get_start('hour') from
+ DateTimeX::Period ( i.e. this module ), would have returned correct epoch:
+ use DateTimeX::Period;
+ my $dt = DateTime::Period->new(
+ 	year=> 2013,
+ 	month => 10,
+ 	day => 26,
+ 	hour => 23,
+ 	minute => 59,
+	second => 59,
+ 	time_zone => 'Atlantic/Azores',
+ );
+ $dt->add( seconds => 1 );    # 2013-10-27T00:00:00  same
+ print $dt->epoch();          # 1382832000           same
+ $dt->get_start('hour');      # 2013-10-27T00:00:00  same
+ print $dt->epoch();          # 1382832000           same
+
+
+All in all, this is convenient and safe module to play with when you can't use
+UTC time. It is great solution for such case as following:
+$user cannot use more than $threshold of something within a day in his local
+time or within your operating timezone. Hence query database using its APIs to
+get $user's $threshold so far and react upon:
+ pretended_api_call_GET_DATA(
+ 	from => $dt->get_start('day')->epoch(),
+ 	to   => $dt->get_end('day')->epoch(),
+ );
 
 =cut
 
@@ -79,7 +172,7 @@ sub get_start
 		# Perl DateTime library always returns later date, when date occurs
 		# twice despite it has ability not to do that. Following while loop
 		# checks that start of the 10 minutes period would not be later then
-		# orifinal object.
+		# original object.
 		while ( $dt->epoch > $self->epoch )
 		{
 			$dt->subtract( minutes => 10 );
@@ -112,28 +205,21 @@ sub get_start
 		try {
 			$dt->truncate( to => 'day' );
 		} catch {
-			$dt = _get_start_of_the_day($dt);
+			$dt->_get_safe_start('day');
 		};
 		return $dt;
 	} elsif ( $period eq 'week') {
 		try {
 			$dt->truncate( to => 'week' );
 		} catch {
-			my $day_of_week = $dt->day_of_week;
-
-			# set to monday, so that we would be on the right day
-			if ( $day_of_week > 1 ) {
-				$dt->set_hour(12)->subtract( days => $day_of_week - 1 );
-			}
-			$dt = _get_start_of_the_day($dt);
+			$dt->_get_safe_start('week');
 		};
 		return $dt;
 	} elsif ( $period eq 'month') {
 		try {
 			$dt->truncate( to => 'month' );
 		} catch {
-			$dt->set_hour(12)->set_day(1);
-			$dt = _get_start_of_the_day($dt);
+			$dt->_get_safe_start('month');
 		};
 		return $dt;
 	} else {
@@ -181,8 +267,7 @@ sub get_end
 				$dt->truncate( to => 'day' );
 			}
 		} catch {
-			$dt->set_hour(12)->add( days => 1 );
-			$dt = _get_start_of_the_day($dt);
+			$dt->_get_safe_end('day');
 		};
 		return $dt;
 	} elsif ( $period eq 'week') {
@@ -193,8 +278,7 @@ sub get_end
 				$dt->truncate( to => 'week' );
 			}
 		} catch {
-			$dt->set_hour(12)->add( weeks => 1 );
-			$dt = _get_start_of_the_day($dt);
+			$dt->_get_safe_end('week');
 		};
 		return $dt;
 	} elsif ( $period eq 'month') {
@@ -205,8 +289,7 @@ sub get_end
 				$dt->truncate( to => 'month' );
 			}
 		} catch {
-			$dt->set_hour(12)->add( months => 1 );
-			$dt = _get_start_of_the_day($dt);
+			$dt->_get_safe_end('month');
 		};
 		return $dt;
 	} else {
@@ -241,62 +324,81 @@ sub get_period_label
 	return $period_labels{$key};
 }
 
-=head2 _get_start_of_the_day($dt)
-
-internal subroutine to get the start of the day. This assumes DST does not
-happen at 12 midday.
-
-=cut
-
-sub _get_start_of_the_day
+# Very slow, though necessary fallback algorithms
+# Provides method to safely get start of day, week and month
+sub _get_safe_start
 {
-	my ( $dt ) = @_;
+	my ( $dt, $period ) = @_;
 
-	# save the current day
-	my $date = $dt->day();
+	if ( $period eq 'day' ) {
+		my $cur_day = $dt->day();
 
-	# to be on the safe side, set clock to 12:00:00, so we would not need to
-	# deal with minutes or seconds
-	$dt->set_hour(12)->set_minute(0)->set_second(0);
+		while ($cur_day == $dt->day()) {
+			$dt->subtract( minutes => 5 );
+		}
+	} elsif ( $period eq 'week' ) {
+		my $cur_week = $dt->week();
 
-	# it should be safe now to get the previous day.
-	my $newdate = $dt->clone()->subtract(days => 1)->day();
+		while ($cur_week == $dt->week()) {
+			$dt->subtract( minutes => 5 );
+		}
+	} elsif ( $period eq 'month' ) {
+		my $cur_month = $dt->month();
 
-	# keep subtracting by 1 hour, until you reach previous day
-	while ( $date != $newdate )
-	{
-		$dt->subtract( hours => 1 );
-		$date = $dt->day();
+		while ($cur_month == $dt->month()) {
+			$dt->subtract( minutes => 5 );
+		}
+	} else {
+		croak "found unknown period '$period'";
 	}
-	# now add 1 hour back, so we know we are in correct day
-	$dt->add( hours => 1 );
 
-	return $dt;
+	$dt->add(minutes => 5);
+	return $dt->get_start('10 minutes');
+}
+
+# Provides safe methods to get end of the hour, day, week and month
+sub _get_safe_end
+{
+	my ( $dt, $period ) = @_;
+
+	if ( $period eq 'hour' ) {
+		my $cur_hour = $dt->hour();
+
+		while ( $cur_hour == $dt->hour() ) {
+			$dt->add( minutes => 5 );
+		}
+	} elsif ( $period eq 'day' ) {
+		my $cur_day = $dt->day();
+
+		while ( $cur_day == $dt->day() ) {
+			$dt->add( minutes => 5 );
+		}
+	} elsif ( $period eq 'week' ) {
+		my $cur_week = $dt->week();
+
+		while ( $cur_week == $dt->week() ) {
+			$dt->add( minutes => 5 );
+		}
+	} elsif ( $period eq 'month' ) {
+		my $cur_month = $dt->month();
+
+		while ( $cur_month == $dt->month() ) {
+			$dt->add( minutes => 5 );
+		}
+	} else {
+		croak "found unknown period '$period'";
+	}
+
+	return $dt->get_start('10 minutes');
 }
 
 =head1 CAVEATS
 
-In timezones such as America/Sao_Paulo, Asia/Beirut, Asia/Damascus etc. etc.
-DST happens at midnight. For these occassions, library falls back to another
-algorithm for calculating start/end of interval. On these occasions assumption
-is made that in those timezones DST will never happen at 12am and again at 12pm
-( see _get_start_of_the_day subroutine ).
-
 Start of the week is always Monday.
-
-
-=head1 AUTHOR
-
-Vytas Dauksa, C<< <vytas.dauksa at smoothwall.net> >>
 
 =head1 BUGS
 
-Please report any bugs or feature requests to C<bug-datetimex-period at rt.cpan.org>, or through
-the web interface at L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=DateTimeX-Period>.  I will be notified, and then you'll
-automatically be notified of progress on your bug as I make changes.
-
-
-
+Please report any bugs or feature requests to L<https://github.com/vytas-dauksa/DateTimeX-Period/issues>.
 
 =head1 SUPPORT
 
@@ -304,73 +406,16 @@ You can find documentation for this module with the perldoc command.
 
     perldoc DateTimeX::Period
 
-
-You can also look for information at:
-
-=over 4
-
-=item * RT: CPAN's request tracker (report bugs here)
-
-L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=DateTimeX-Period>
-
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/DateTimeX-Period>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/DateTimeX-Period>
-
-=item * Search CPAN
-
-L<http://search.cpan.org/dist/DateTimeX-Period/>
-
-=back
-
-
 =head1 ACKNOWLEDGEMENTS
 
+This module has been written by Vytas Dauksa <vytas.dauksa@smoothwall.net>.
 
-=head1 LICENSE AND COPYRIGHT
+=head1 COPYRIGHT AND LICENSE
 
-Copyright 2014 Smoothwall.
+Copyright (C) 2014, Smoothwall.
 
-This program is free software; you can redistribute it and/or modify it
-under the terms of the the Artistic License (2.0). You may obtain a
-copy of the full license at:
-
-L<http://www.perlfoundation.org/artistic_license_2_0>
-
-Any use, modification, and distribution of the Standard or Modified
-Versions is governed by this Artistic License. By using, modifying or
-distributing the Package, you accept this license. Do not use, modify,
-or distribute the Package, if you do not accept this license.
-
-If your Modified Version has been derived from a Modified Version made
-by someone other than you, you are nevertheless required to ensure that
-your Modified Version complies with the requirements of this license.
-
-This license does not grant you the right to use any trademark, service
-mark, tradename, or logo of the Copyright Holder.
-
-This license includes the non-exclusive, worldwide, free-of-charge
-patent license to make, have made, use, offer to sell, sell, import and
-otherwise transfer the Package with respect to any patent claims
-licensable by the Copyright Holder that are necessarily infringed by the
-Package. If you institute patent litigation (including a cross-claim or
-counterclaim) against any party alleging that the Package constitutes
-direct or contributory patent infringement, then this Artistic License
-to you shall terminate on the date that such litigation is filed.
-
-Disclaimer of Warranty: THE PACKAGE IS PROVIDED BY THE COPYRIGHT HOLDER
-AND CONTRIBUTORS "AS IS' AND WITHOUT ANY EXPRESS OR IMPLIED WARRANTIES.
-THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
-PURPOSE, OR NON-INFRINGEMENT ARE DISCLAIMED TO THE EXTENT PERMITTED BY
-YOUR LOCAL LAW. UNLESS REQUIRED BY LAW, NO COPYRIGHT HOLDER OR
-CONTRIBUTOR WILL BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, OR
-CONSEQUENTIAL DAMAGES ARISING IN ANY WAY OUT OF THE USE OF THE PACKAGE,
-EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-
+This program is free software, you can redistribute it and/or modify it under
+the terms of the Artistic License version 2.0.
 
 =cut
 
